@@ -10,54 +10,64 @@ const PORT = process.env.PORT || 8611;
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
 app.use(express.json());
 
-// 1. 전역 데이터 영속 저장을 위한 파일 경로
+// 영구 파일 스토어 경로
 const DDAY_FILE = path.join(__dirname, 'dday_config.json');
 const DDAY_TEMP = path.join(__dirname, 'dday_config.json.tmp');
 
 const ALBUM_FILE = path.join(__dirname, 'photo_album.json');
 const ALBUM_TEMP = path.join(__dirname, 'photo_album.json.tmp');
 
-// 초기 기본 상태
 let sharedDdayConfig = { title: '나은', date: '2026-07-24' };
 let sharedPhotoAlbum = {
     url: "https://photos.app.goo.gl/qSyFwXqYZ7ZhYovp8",
     images: []
 };
 
-// 원자적 파일 저장 (Atomic Write)
+// 파일 I/O 레이스 조건 방지를 위한 순차 직렬화 큐
+let isSavingDday = false;
+let isSavingAlbum = false;
+
 async function loadDb() {
     try {
         const ddayData = await fs.readFile(DDAY_FILE, 'utf8');
         sharedDdayConfig = JSON.parse(ddayData);
-        console.log('[DB Loaded] D-Day Config:', sharedDdayConfig);
+        console.log('[DB Loaded] D-Day Config Sync Success');
     } catch (e) {
-        console.log('[DB Init] 기본 D-Day 설정 사용');
+        console.log('[DB Init] D-Day 기본값 사용');
     }
 
     try {
         const albumData = await fs.readFile(ALBUM_FILE, 'utf8');
         sharedPhotoAlbum = JSON.parse(albumData);
-        console.log('[DB Loaded] Album Config Images:', sharedPhotoAlbum.images.length);
+        console.log(`[DB Loaded] Album Config Sync Success (${sharedPhotoAlbum.images.length}장)`);
     } catch (e) {
-        console.log('[DB Init] 기본 앨범 설정 사용');
+        console.log('[DB Init] 앨범 기본값 사용');
     }
 }
 
 async function saveDdayDb() {
+    if (isSavingDday) return;
+    isSavingDday = true;
     try {
         await fs.writeFile(DDAY_TEMP, JSON.stringify(sharedDdayConfig, null, 2), 'utf8');
         await fs.rename(DDAY_TEMP, DDAY_FILE);
     } catch (e) {
         console.error('[DB Save Error] D-Day:', e.message);
+    } finally {
+        isSavingDday = false;
     }
 }
 
 async function saveAlbumDb() {
+    if (isSavingAlbum) return;
+    isSavingAlbum = true;
     try {
         await fs.writeFile(ALBUM_TEMP, JSON.stringify(sharedPhotoAlbum, null, 2), 'utf8');
         await fs.rename(ALBUM_TEMP, ALBUM_FILE);
     } catch (e) {
         console.error('[DB Save Error] Album:', e.message);
+    } finally {
+        isSavingAlbum = false;
     }
 }
 
@@ -73,7 +83,7 @@ const httpClient = axios.create({
     }
 });
 
-// 2. D-Day 전역 동기화 API
+// D-Day API
 app.get('/api/dday', (req, res) => res.json({ status: 'success', data: sharedDdayConfig }));
 
 app.post('/api/dday', async (req, res) => {
@@ -81,11 +91,10 @@ app.post('/api/dday', async (req, res) => {
     if (title) sharedDdayConfig.title = title.trim();
     if (date) sharedDdayConfig.date = date;
     await saveDdayDb();
-    console.log(`[D-Day Updated]: ${sharedDdayConfig.title} / ${sharedDdayConfig.date}`);
     return res.json({ status: 'success', data: sharedDdayConfig });
 });
 
-// 3. 전역 공유 구글 포토 앨범 조회 API
+// 전역 공유 구글 포토 앨범 조회 API
 app.get('/api/shared_photo_album', (req, res) => {
     return res.json({ status: 'success', data: sharedPhotoAlbum });
 });
@@ -107,7 +116,7 @@ async function parseGooglePhotosUrl(albumUrl) {
         .map(url => `${url.split('=')[0]}=w1920-h1080-no`);
 }
 
-// 4. 구글 포토 파싱 및 전역 저장 API
+// 구글 포토 파싱 및 전역 동기화 API
 app.get('/api/parse_google_photos', async (req, res) => {
     const albumUrl = req.query.url;
     if (!albumUrl || (!albumUrl.includes('photos.app.goo.gl') && !albumUrl.includes('photos.google.com'))) {
@@ -123,7 +132,7 @@ app.get('/api/parse_google_photos', async (req, res) => {
             console.log(`[Shared Album Updated]: ${albumUrl} (${images.length}장)`);
             return res.json({ status: 'success', count: images.length, images: images });
         } else {
-            return res.status(404).json({ status: 'error', message: '앨범 내 사진을 추출하지 못했습니다. 공개 설정을 확인하세요.' });
+            return res.status(404).json({ status: 'error', message: '앨범 내 사진을 추출하지 못했습니다. 공개 상태를 확인하세요.' });
         }
     } catch (e) {
         console.error('[Google Photos Scraping Error]:', e.message);
@@ -131,7 +140,7 @@ app.get('/api/parse_google_photos', async (req, res) => {
     }
 });
 
-// 5. 국내 방송사 라디오 라이브 주소 파서
+// 국내 방송사 라디오 라이브 주소 파서
 async function getKbsStream(channelCode) {
     try {
         const resp = await httpClient.get(`https://cfpwwwapi.kbs.co.kr/api/v1/landing/live/channel_code/${channelCode}`, {
@@ -181,5 +190,5 @@ app.get('/api/get_stream_url', async (req, res) => {
     return res.status(500).json({ status: 'error', message: 'Failed to parse stream URL' });
 });
 
-app.get('/', (req, res) => res.send('Smart Home Dashboard Long-Term Production Server Active'));
-app.listen(PORT, '0.0.0.0', () => console.log(`[Smart Home Production Backend Active] Port: ${PORT}`));
+app.get('/', (req, res) => res.send('Smart Home Dashboard Long-Term Production Backend Active'));
+app.listen(PORT, '0.0.0.0', () => console.log(`[Smart Home Backend Running] Port: ${PORT}`));
